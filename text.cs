@@ -1,12 +1,9 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
+using Azure;
+using Azure.Search.Documents;
+using Azure.Search.Documents.Models;
+using Microsoft.Extensions.Configuration;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
 
 namespace AzureSearchMigrator
 {
@@ -30,7 +27,7 @@ namespace AzureSearchMigrator
                 var targetIndexName = Configuration["TargetSearchService:IndexName"];
                 var targetAdminApiKey = Configuration["TargetSearchService:AdminApiKey"];
 
-                // Use the configured batch size or default to 500 (smaller for large indexes)
+                // Use the configured batch size or default to 500
                 if (!int.TryParse(Configuration["MigrationSettings:BatchSize"], out int batchSize))
                 {
                     batchSize = 500;
@@ -89,8 +86,8 @@ namespace AzureSearchMigrator
                 }
                 else
                 {
-                    // Use range queries for larger indexes
-                    Console.WriteLine("Step 4: Using range query pagination (index size > 100,000 documents)...");
+                    // Try to use range queries for larger indexes
+                    Console.WriteLine("Step 4: Attempting to use range query pagination (index size > 100,000 documents)...");
                     await MigrateWithRangeQueriesAsync(
                         sourceServiceName, sourceIndexName, sourceAdminApiKey,
                         targetServiceName, targetIndexName, targetAdminApiKey,
@@ -161,7 +158,7 @@ namespace AzureSearchMigrator
 
                     using var doc = JsonDocument.Parse(indexSchema);
                     var newSchema = RemoveReadOnlyProperties(doc.RootElement);
-                    var content = new StringContent(newSchema, System.Text.Encoding.UTF8, "application/json");
+                    var content = new StringContent(newSchema, Encoding.UTF8, "application/json");
 
                     var response = await httpClient.PutAsync(url, content);
 
@@ -425,7 +422,19 @@ namespace AzureSearchMigrator
                 return;
             }
 
-            Console.WriteLine($"Using field '{keyField}' for range query pagination.");
+            // Check if the field is sortable (required for range queries)
+            var isSortable = await IsFieldSortableAsync(sourceServiceName, sourceIndexName, sourceApiKey, keyField, apiVersion);
+            if (!isSortable)
+            {
+                Console.WriteLine($"❌ Field '{keyField}' is not sortable. Range queries require a sortable field. Falling back to continuation tokens.");
+                await MigrateWithContinuationTokensAsync(
+                    sourceServiceName, sourceIndexName, sourceApiKey,
+                    targetServiceName, targetIndexName, targetApiKey,
+                    batchSize, totalDocuments, apiVersion);
+                return;
+            }
+
+            Console.WriteLine($"Using field '{keyField}' for range query pagination (sortable: yes).");
 
             // Get the min and max values for the key field
             var (minValue, maxValue) = await GetKeyFieldRangeAsync(sourceServiceName, sourceIndexName, sourceApiKey, keyField, apiVersion);
@@ -716,7 +725,7 @@ namespace AzureSearchMigrator
                         queryType = "simple",
                         searchMode = "all",
                         select = "*",  // Get all fields
-                        orderby = "search.score() desc"  // Ensure consistent ordering
+                        orderby = new[] { "search.score() desc" }  // Ensure consistent ordering
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
@@ -775,7 +784,7 @@ namespace AzureSearchMigrator
         {
             try
             {
-                // First, try to get the index schema to identify the key field
+                // First, try to get the key field from the index schema
                 using (var httpClient = new HttpClient())
                 {
                     var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}?api-version={apiVersion}";
@@ -787,19 +796,17 @@ namespace AzureSearchMigrator
                         var schemaJson = await response.Content.ReadAsStringAsync();
                         using (var doc = JsonDocument.Parse(schemaJson))
                         {
-                            // Look for the key field in the index definition
+                            // Look for the key field in the schema
                             if (doc.RootElement.TryGetProperty("fields", out var fields))
                             {
                                 foreach (var field in fields.EnumerateArray())
                                 {
-                                    if (field.TryGetProperty("key", out var keyProp) && 
-                                        keyProp.ValueKind == JsonValueKind.True)
+                                    if (field.TryGetProperty("key", out var isKey) && isKey.GetBoolean())
                                     {
-                                        if (field.TryGetProperty("name", out var nameProp))
+                                        if (field.TryGetProperty("name", out var keyName))
                                         {
-                                            var keyFieldName = nameProp.GetString();
-                                            Console.WriteLine($"Found key field from schema: {keyFieldName}");
-                                            return keyFieldName;
+                                            Console.WriteLine($"Found key field from schema: {keyName.GetString()}");
+                                            return keyName.GetString();
                                         }
                                     }
                                 }
@@ -808,27 +815,66 @@ namespace AzureSearchMigrator
                     }
                 }
 
-                // Fallback to sample document approach
+                // Fallback: Get sample documents to identify a good key field
                 Console.WriteLine("Key field not found in schema, analyzing sample documents...");
-                
                 var samples = await GetSampleDocumentsAsync(serviceName, indexName, apiKey, 10, apiVersion);
+                
+                if (samples.Count == 0)
+                {
+                    Console.WriteLine("No sample documents found to analyze");
+                    return null;
+                }
 
+                // Common key field names in Azure Search
+                var commonKeyNames = new[] { 
+                    "id", "key", "documentId", "docId", "recordId", 
+                    "document_id", "doc_id", "record_id", "Id", "ID",
+                    "DocumentId", "DocId", "RecordId"
+                };
+
+                // Check sample documents for common key field names
                 foreach (var sample in samples)
                 {
-                    // Look for fields that might be keys (case-insensitive)
-                    var potentialKeys = sample.Where(kvp =>
-                        kvp.Value != null &&
-                        (kvp.Key.Equals("id", StringComparison.OrdinalIgnoreCase) ||
-                        kvp.Key.Equals("key", StringComparison.OrdinalIgnoreCase) ||
-                        kvp.Key.Contains("id", StringComparison.OrdinalIgnoreCase)))
-                        .ToList();
-
-                    if (potentialKeys.Any())
+                    foreach (var commonKey in commonKeyNames)
                     {
-                        var keyField = potentialKeys.First().Key;
-                        Console.WriteLine($"Selected key field from sample: {keyField}");
-                        return keyField;
+                        if (sample.ContainsKey(commonKey))
+                        {
+                            Console.WriteLine($"Found potential key field: {commonKey}");
+                            return commonKey;
+                        }
                     }
+                }
+
+                // If no common key found, look for the first field that might be a key
+                // (string field that appears to have unique values)
+                if (samples.Count > 1)
+                {
+                    var firstDoc = samples.First();
+                    
+                    // Try to find a string field that might be a key
+                    var stringFields = firstDoc.Where(kvp => kvp.Value is string).ToList();
+                    foreach (var field in stringFields)
+                    {
+                        var fieldName = field.Key;
+                        var values = samples.Select(s => s.ContainsKey(fieldName) ? s[fieldName]?.ToString() : null)
+                                            .Where(v => v != null)
+                                            .Distinct()
+                                            .ToList();
+                        
+                        if (values.Count == samples.Count)
+                        {
+                            Console.WriteLine($"Field '{fieldName}' appears to have unique values, using as key");
+                            return fieldName;
+                        }
+                    }
+                }
+
+                // Last resort: use the first field
+                if (samples.Count > 0)
+                {
+                    var firstField = samples.First().First().Key;
+                    Console.WriteLine($"Using first field '{firstField}' as key field (may not be optimal)");
+                    return firstField;
                 }
 
                 return null;
@@ -840,6 +886,50 @@ namespace AzureSearchMigrator
             }
         }
 
+        static async Task<bool> IsFieldSortableAsync(string serviceName, string indexName, string apiKey, string fieldName, string apiVersion)
+        {
+            try
+            {
+                using (var httpClient = new HttpClient())
+                {
+                    var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}?api-version={apiVersion}";
+                    httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
+
+                    var response = await httpClient.GetAsync(url);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var schemaJson = await response.Content.ReadAsStringAsync();
+                        using (var doc = JsonDocument.Parse(schemaJson))
+                        {
+                            if (doc.RootElement.TryGetProperty("fields", out var fields))
+                            {
+                                foreach (var field in fields.EnumerateArray())
+                                {
+                                    if (field.TryGetProperty("name", out var name) && 
+                                        name.GetString() == fieldName)
+                                    {
+                                        // Check if sortable property exists and is true
+                                        if (field.TryGetProperty("sortable", out var sortable))
+                                        {
+                                            return sortable.GetBoolean();
+                                        }
+                                        // If sortable property doesn't exist, default to false
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error checking if field is sortable: {ex.Message}");
+            }
+            
+            return false;
+        }
+
         static async Task<(object minValue, object maxValue)> GetKeyFieldRangeAsync(string serviceName, string indexName, string apiKey, string keyField, string apiVersion)
         {
             try
@@ -849,54 +939,93 @@ namespace AzureSearchMigrator
                     var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/search?api-version={apiVersion}";
                     httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
 
-                    // Get min value
-                    var minRequest = new
+                    // First, determine the type of the key field by looking at a sample
+                    var typeCheckRequest = new
                     {
                         search = "*",
                         top = 1,
-                        orderby = $"{keyField} asc",
-                        select = keyField
+                        select = new[] { keyField }
                     };
 
-                    var minContent = new StringContent(JsonSerializer.Serialize(minRequest), Encoding.UTF8, "application/json");
-                    var minResponse = await httpClient.PostAsync(url, minContent);
+                    var typeCheckContent = new StringContent(JsonSerializer.Serialize(typeCheckRequest), Encoding.UTF8, "application/json");
+                    var typeCheckResponse = await httpClient.PostAsync(url, typeCheckContent);
 
-                    if (minResponse.IsSuccessStatusCode)
+                    if (!typeCheckResponse.IsSuccessStatusCode)
                     {
-                        var minJson = await minResponse.Content.ReadAsStringAsync();
-                        using (var doc = JsonDocument.Parse(minJson))
+                        Console.WriteLine($"Failed to check field type: {typeCheckResponse.StatusCode}");
+                        return (null, null);
+                    }
+
+                    var typeCheckJson = await typeCheckResponse.Content.ReadAsStringAsync();
+                    using (var typeCheckDoc = JsonDocument.Parse(typeCheckJson))
+                    {
+                        if (!typeCheckDoc.RootElement.TryGetProperty("value", out var typeCheckArray) || 
+                            typeCheckArray.GetArrayLength() == 0)
                         {
-                            if (doc.RootElement.TryGetProperty("value", out var valueArray) && valueArray.GetArrayLength() > 0)
+                            return (null, null);
+                        }
+
+                        var sampleDoc = typeCheckArray.EnumerateArray().First();
+                        if (!sampleDoc.TryGetProperty(keyField, out var sampleValue))
+                        {
+                            return (null, null);
+                        }
+
+                        // Determine the field type and build appropriate orderby
+                        bool isStringField = sampleValue.ValueKind == JsonValueKind.String;
+                        
+                        // Get min value
+                        var minRequest = new
+                        {
+                            search = "*",
+                            top = 1,
+                            orderby = new[] { $"{keyField} asc" },
+                            select = new[] { keyField }
+                        };
+
+                        var minContent = new StringContent(JsonSerializer.Serialize(minRequest), Encoding.UTF8, "application/json");
+                        var minResponse = await httpClient.PostAsync(url, minContent);
+
+                        if (minResponse.IsSuccessStatusCode)
+                        {
+                            var minJson = await minResponse.Content.ReadAsStringAsync();
+                            using (var minDoc = JsonDocument.Parse(minJson))
                             {
-                                var firstDoc = valueArray.EnumerateArray().First();
-                                if (firstDoc.TryGetProperty(keyField, out var minField))
+                                if (minDoc.RootElement.TryGetProperty("value", out var minValueArray) && 
+                                    minValueArray.GetArrayLength() > 0)
                                 {
-                                    var minValue = GetValueFromJsonElement(minField);
-
-                                    // Get max value
-                                    var maxRequest = new
+                                    var firstDoc = minValueArray.EnumerateArray().First();
+                                    if (firstDoc.TryGetProperty(keyField, out var minField))
                                     {
-                                        search = "*",
-                                        top = 1,
-                                        orderby = $"{keyField} desc",
-                                        select = keyField
-                                    };
+                                        var minValue = GetValueFromJsonElement(minField);
 
-                                    var maxContent = new StringContent(JsonSerializer.Serialize(maxRequest), Encoding.UTF8, "application/json");
-                                    var maxResponse = await httpClient.PostAsync(url, maxContent);
-
-                                    if (maxResponse.IsSuccessStatusCode)
-                                    {
-                                        var maxJson = await maxResponse.Content.ReadAsStringAsync();
-                                        using (var maxDoc = JsonDocument.Parse(maxJson))
+                                        // Get max value
+                                        var maxRequest = new
                                         {
-                                            if (maxDoc.RootElement.TryGetProperty("value", out var maxValueArray) && maxValueArray.GetArrayLength() > 0)
+                                            search = "*",
+                                            top = 1,
+                                            orderby = new[] { $"{keyField} desc" },
+                                            select = new[] { keyField }
+                                        };
+
+                                        var maxContent = new StringContent(JsonSerializer.Serialize(maxRequest), Encoding.UTF8, "application/json");
+                                        var maxResponse = await httpClient.PostAsync(url, maxContent);
+
+                                        if (maxResponse.IsSuccessStatusCode)
+                                        {
+                                            var maxJson = await maxResponse.Content.ReadAsStringAsync();
+                                            using (var maxDoc = JsonDocument.Parse(maxJson))
                                             {
-                                                var lastDoc = maxValueArray.EnumerateArray().First();
-                                                if (lastDoc.TryGetProperty(keyField, out var maxField))
+                                                if (maxDoc.RootElement.TryGetProperty("value", out var maxValueArray) && 
+                                                    maxValueArray.GetArrayLength() > 0)
                                                 {
-                                                    var maxValue = GetValueFromJsonElement(maxField);
-                                                    return (minValue, maxValue);
+                                                    var lastDoc = maxValueArray.EnumerateArray().First();
+                                                    if (lastDoc.TryGetProperty(keyField, out var maxField))
+                                                    {
+                                                        var maxValue = GetValueFromJsonElement(maxField);
+                                                        Console.WriteLine($"Key field '{keyField}' range: {minValue} to {maxValue} (Type: {(isStringField ? "string" : "numeric")})");
+                                                        return (minValue, maxValue);
+                                                    }
                                                 }
                                             }
                                         }
@@ -926,53 +1055,30 @@ namespace AzureSearchMigrator
                     var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/search?api-version={apiVersion}";
                     httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
 
-                    // Build filter for range query - IMPROVED STRING HANDLING
+                    // Build filter for range query
                     string filter;
-                    
-                    // Check if the value is a string (including when boxed as object)
-                    if (startValue is string stringValue)
+                    if (startValue is string)
                     {
-                        // Escape single quotes in the string value
-                        string escapedValue = stringValue.Replace("'", "''");
-                        filter = $"{keyField} ge '{escapedValue}'";
-                        Console.WriteLine($"Using string filter: {filter}");
+                        // Escape single quotes in string values
+                        string escapedValue = startValue.ToString().Replace("'", "''");
+                        filter = $"{keyField} gt '{escapedValue}'";
                     }
-                    else if (startValue is int intValue)
+                    else if (startValue is int || startValue is long || startValue is double)
                     {
-                        filter = $"{keyField} ge {intValue}";
-                    }
-                    else if (startValue is long longValue)
-                    {
-                        filter = $"{keyField} ge {longValue}";
-                    }
-                    else if (startValue is double doubleValue)
-                    {
-                        filter = $"{keyField} ge {doubleValue}";
-                    }
-                    else if (startValue is decimal decimalValue)
-                    {
-                        filter = $"{keyField} ge {decimalValue}";
-                    }
-                    else if (startValue is DateTime dateTimeValue)
-                    {
-                        // Format DateTime for OData
-                        filter = $"{keyField} ge {dateTimeValue:yyyy-MM-ddTHH:mm:ssZ}";
+                        filter = $"{keyField} gt {startValue}";
                     }
                     else
                     {
-                        // Fallback - treat as string with ToString()
-                        string escapedValue = startValue?.ToString().Replace("'", "''") ?? "";
-                        filter = $"{keyField} ge '{escapedValue}'";
-                        Console.WriteLine($"Using fallback string filter: {filter}");
+                        filter = $"{keyField} gt '{startValue}'";
                     }
 
                     var searchRequest = new
                     {
                         search = "*",
                         top = top,
-                        orderby = $"{keyField} asc",
+                        orderby = new[] { $"{keyField} asc" },
                         filter = filter,
-                        select = "*"
+                        select = new[] { "*" }
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
@@ -1010,13 +1116,6 @@ namespace AzureSearchMigrator
                             if (lastDocument.ContainsKey(keyField))
                             {
                                 nextStartValue = lastDocument[keyField];
-                                
-                                // Ensure we don't get stuck in an infinite loop
-                                if (nextStartValue?.ToString() == startValue?.ToString())
-                                {
-                                    Console.WriteLine("⚠ Warning: Next start value equals current start value. This might cause an infinite loop.");
-                                    nextStartValue = null;
-                                }
                             }
                         }
 
@@ -1025,7 +1124,6 @@ namespace AzureSearchMigrator
                     else
                     {
                         var error = await response.Content.ReadAsStringAsync();
-                        Console.WriteLine($"Failed with filter: {filter}");
                         throw new Exception($"Range query failed: {response.StatusCode} - {error}");
                     }
                 }
@@ -1054,15 +1152,15 @@ namespace AzureSearchMigrator
                         top = top,
                         queryType = "simple",
                         searchMode = "all",
-                        select = "*"
+                        select = new[] { "*" }
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
 
                     if (!string.IsNullOrEmpty(continuationToken))
                     {
-                        httpClient.DefaultRequestHeaders.Remove("continuationToken");
-                        httpClient.DefaultRequestHeaders.Add("continuationToken", continuationToken);
+                        httpClient.DefaultRequestHeaders.Remove("continuation-token");
+                        httpClient.DefaultRequestHeaders.Add("continuation-token", continuationToken);
                     }
 
                     var response = await httpClient.PostAsync(url, content);
@@ -1092,7 +1190,7 @@ namespace AzureSearchMigrator
                             }
                         }
 
-                        if (response.Headers.TryGetValues("continuationToken", out var tokenValues))
+                        if (response.Headers.TryGetValues("continuation-token", out var tokenValues))
                         {
                             nextContinuationToken = tokenValues.FirstOrDefault();
                         }
@@ -1149,7 +1247,7 @@ namespace AzureSearchMigrator
                         return false; // Signal to reduce batch size
                     }
 
-                    var content = new StringContent(JsonSerializer.Serialize(indexRequest), Encoding.UTF8, "application/json");
+                    var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
                     var response = await httpClient.PostAsync(url, content);
 
                     if (response.IsSuccessStatusCode)
@@ -1289,7 +1387,8 @@ namespace AzureSearchMigrator
                     {
                         search = "*",
                         top = count,
-                        queryType = "simple"
+                        queryType = "simple",
+                        select = new[] { "*" }
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
@@ -1373,7 +1472,8 @@ namespace AzureSearchMigrator
                         search = "*",
                         filter = filter,
                         top = 1,
-                        queryType = "simple"
+                        queryType = "simple",
+                        select = new[] { keyField }
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
